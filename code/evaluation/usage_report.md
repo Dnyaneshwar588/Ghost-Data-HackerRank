@@ -1,15 +1,15 @@
 # Model usage report
 
-This is the report for the final full-dataset run that generated `output.csv`.
+Final full-dataset run: 518 requests.
 
-- Provider: none (deterministic local Python/Pandas pipeline)
+- Provider: none
 - Model name: none
-- Model calls: 0
+- API calls: 0
 - Input tokens: 0
 - Output tokens: 0
 - Total tokens: 0
-- Average tokens per request: 0
+- Average tokens per request: 0.00
 - Estimated total cost: $0.00
 - Estimated cost per request: $0.00
 
-No external model, API key, credential, or hosted inference service was used.
+The default run uses no external model and therefore has zero calls and zero tokens.

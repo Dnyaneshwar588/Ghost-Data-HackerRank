@@ -6,8 +6,6 @@ treated as proof of deletion.
 """
 from __future__ import annotations
 
-import csv
-import hashlib
 import json
 import re
 from dataclasses import dataclass
@@ -16,6 +14,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 import pandas as pd
+from llm import GroqEvidenceInterpreter
 
 PHASE_ORDER = {"FINDING": 0, "REMEDIATION": 1, "VERIFICATION": 2}
 OP_ORDER = {
@@ -26,6 +25,23 @@ OP_ORDER = {
     "VERIFY_RECORD_ABSENT": 0, "VERIFY_RECORD_PRESENT": 1,
     "VERIFY_RECORD_REDACTED": 2, "VERIFY_RECORD_ANONYMIZED": 3,
     "VERIFY_DATA_FLOW_DISABLED": 4, "VERIFY_RESTORE_BLOCKED": 5,
+}
+OP_STATE = {
+    "REPORT_REMAINING_RECORD": ("FINDING", "PRESENT"),
+    "REPORT_EXPOSED_PII": ("FINDING", "PRESENT"),
+    "REPORT_ACTIVE_DATA_FLOW": ("FINDING", "ACTIVE"),
+    "REPORT_RESTORE_RISK": ("FINDING", "ACTIVE"),
+    "DISABLE_DATA_FLOW": ("REMEDIATION", "DISABLED"),
+    "BLOCK_RESTORE": ("REMEDIATION", "BLOCKED"),
+    "DELETE_RECORD": ("REMEDIATION", "ABSENT"),
+    "REDACT_RECORD": ("REMEDIATION", "REDACTED"),
+    "ANONYMIZE_RECORD": ("REMEDIATION", "ANONYMIZED"),
+    "VERIFY_RECORD_ABSENT": ("VERIFICATION", "ABSENT"),
+    "VERIFY_RECORD_PRESENT": ("VERIFICATION", "PRESENT"),
+    "VERIFY_RECORD_REDACTED": ("VERIFICATION", "REDACTED"),
+    "VERIFY_RECORD_ANONYMIZED": ("VERIFICATION", "ANONYMIZED"),
+    "VERIFY_DATA_FLOW_DISABLED": ("VERIFICATION", "DISABLED"),
+    "VERIFY_RESTORE_BLOCKED": ("VERIFICATION", "BLOCKED"),
 }
 RULE_ACTION = {
     "USER_PROFILE": "DELETE", "SECONDARY_IDENTIFIER": "DELETE",
@@ -120,6 +136,7 @@ class AuditAgent:
         self.activities = pd.read_csv(dataset / "system_activity.csv").fillna("")
         self.identities = IdentityResolver(dataset)
         self.evidence = EvidenceExtractor(dataset)
+        self.interpreter = GroqEvidenceInterpreter()
         self.resource_re = re.compile(
             r"\b(?:account|search|support|export|analytics|audit_record|backup|data_flow|"
             r"marketing|delivery|telemetry|cache|object|tombstone)[_-][A-Za-z0-9-]+\b", re.I)
@@ -150,6 +167,10 @@ class AuditAgent:
         users, tokens = self.identities.resolve(row.email)
         audit_at = dt(row.audit_at)
         evidence = self.evidence.matching(tokens, audit_at)
+        self.interpreter.interpret(
+            tokens,
+            [{"file_id": item.file_id, "text": item.text[:12000]} for item in evidence],
+        )
         activities = self._activity_matches(tokens, audit_at)
         findings: list[dict[str, Any]] = []
         resources: dict[tuple[str, str], tuple[str, str, str]] = {}
@@ -276,7 +297,7 @@ class AuditAgent:
         return pd.DataFrame(rows).sort_values("case_id").reset_index(drop=True)
 
 
-def validate_output(output: Path, request_count: int) -> list[str]:
+def validate_output(output: Path, request_count: int, evidence_ids: set[str] | None = None) -> list[str]:
     errors: list[str] = []
     data = pd.read_csv(output)
     if list(data.columns) != ["case_id", "deletion_status", "steps_json"]:
@@ -284,6 +305,7 @@ def validate_output(output: Path, request_count: int) -> list[str]:
     if len(data) != request_count or data.case_id.duplicated().any():
         errors.append("row count or uniqueness mismatch")
     allowed = {"COMPLETE", "INCOMPLETE", "NOT_APPLICABLE"}
+    evidence_ids = evidence_ids or set()
     for _, row in data.iterrows():
         if row.deletion_status not in allowed: errors.append(f"invalid status {row.case_id}")
         try: steps = json.loads(row.steps_json)
@@ -293,4 +315,11 @@ def validate_output(output: Path, request_count: int) -> list[str]:
             if set(step) != {"step_no","phase","system_id","resource_id","operation","state","evidence_id"}:
                 errors.append(f"schema {row.case_id}"); break
             if step["step_no"] != i: errors.append(f"numbering {row.case_id}"); break
+            if step["operation"] not in OP_STATE or OP_STATE[step["operation"]] != (
+                    step["phase"], step["state"]):
+                errors.append(f"operation/state {row.case_id}")
+            if step["evidence_id"] and evidence_ids and step["evidence_id"] not in evidence_ids:
+                errors.append(f"evidence {row.case_id}")
+        if row.deletion_status == "COMPLETE" and any(not step["evidence_id"] for step in steps):
+            errors.append(f"complete citation {row.case_id}")
     return sorted(set(errors))
