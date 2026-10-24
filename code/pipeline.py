@@ -112,6 +112,33 @@ class EvidenceExtractor:
         return [e for e in self.items if e.readable and e.captured_at <= at and
                 any(t in norm(e.text) for t in tokens)]
 
+    def related_resources(self, item: Evidence, tokens: Iterable[str],
+                          resource_re: re.Pattern[str]) -> list[str]:
+        tokens = [norm(token) for token in tokens if norm(token)]
+        if item.path.suffix.lower() == ".json":
+            try:
+                payload = json.loads(item.text)
+            except json.JSONDecodeError:
+                return []
+            found: list[str] = []
+            def visit(value: Any) -> None:
+                if isinstance(value, dict):
+                    serialized = norm(json.dumps(value, ensure_ascii=False))
+                    if value.get("resource_id") and any(token in serialized for token in tokens):
+                        found.append(str(value["resource_id"]))
+                    for child in value.values():
+                        visit(child)
+                elif isinstance(value, list):
+                    for child in value:
+                        visit(child)
+            visit(payload)
+            return found
+        return [
+            resource for line in item.text.splitlines()
+            if any(token in norm(line) for token in tokens)
+            for resource in resource_re.findall(line)
+        ]
+
 
 class IdentityResolver:
     def __init__(self, root: Path) -> None:
@@ -121,8 +148,17 @@ class IdentityResolver:
     def resolve(self, email: str) -> tuple[list[str], list[str]]:
         email_n = norm(email)
         users = set(self.current.loc[self.current.email.map(norm) == email_n, "user_id"].tolist())
+        if not users:
+            for row in self.audit.to_dict("records"):
+                values = {norm(row["old_value"]), norm(row["new_value"])}
+                if email_n in values:
+                    users.add(row["user_id"])
         changed = self.audit[self.audit.user_id.isin(users)]
         tokens = {email_n, *users}
+        for user_id in users:
+            current = self.current[self.current.user_id == user_id]
+            for row in current.to_dict("records"):
+                tokens.update(norm(row[k]) for k in ("email", "email_hash", "phone", "name") if row[k])
         for row in changed.to_dict("records"):
             if row["field_name"] in {"email", "email_hash", "phone", "name"}:
                 tokens.update(norm(row[k]) for k in ("old_value", "new_value") if row[k])
@@ -146,6 +182,70 @@ class AuditAgent:
         hay = self.activities.details.map(norm)
         return self.activities[mask & hay.map(lambda x: any(t in x for t in tokens))]
 
+    def _activity_window(self, row: pd.Series) -> pd.DataFrame:
+        start = pd.Timestamp(dt(row.requested_at))
+        end = pd.Timestamp(dt(row.reported_at)) + pd.Timedelta(hours=2)
+        times = pd.to_datetime(self.activities.event_time, utc=True)
+        return self.activities[
+            (times >= start) & (times <= end) &
+            self.activities.event_type.isin({
+                "DELETE_RECORD", "REDACT_RECORD", "ANONYMIZE_RECORD",
+                "SYNC_RECORD", "CHECK_DATA_FLOW", "CHECK_RESTORE_ACCESS",
+                "DISABLE_DATA_FLOW", "BLOCK_RESTORE",
+            })
+        ].sort_values("event_time")
+
+    def _state_evidence(self, resource: str, evidence: list[Evidence]) -> tuple[str, str]:
+        direct = [item for item in evidence if resource.lower() in item.text.lower()]
+        if direct:
+            fragments: list[str] = []
+            for item in direct:
+                if item.path.suffix.lower() == ".json":
+                    try:
+                        payload = json.loads(item.text)
+                    except json.JSONDecodeError:
+                        payload = None
+                    def visit(value: Any) -> None:
+                        if isinstance(value, dict):
+                            if str(value.get("resource_id", "")).lower() == resource.lower():
+                                fragments.append(json.dumps(value, ensure_ascii=False))
+                            for child in value.values():
+                                visit(child)
+                        elif isinstance(value, list):
+                            for child in value:
+                                visit(child)
+                    visit(payload)
+                else:
+                    fragments.extend(
+                        line for line in item.text.splitlines()
+                        if resource.lower() in line.lower()
+                    )
+            text = "\n".join(fragments).lower()
+            if item.path.suffix.lower() == ".json":
+                if re.search(r'"(?:name|email|phone|email_hash|requester_email|requester_name|requester_phone)": null', text):
+                    if (
+                        '"account_status": "deleted"' in text
+                        or '"requester_email": null' in text
+                    ):
+                        return "REDACTED", direct[-1].file_id
+                if '"restore_allowed": false' in text:
+                    return "BLOCKED", direct[-1].file_id
+                if '"enabled": false' in text:
+                    return "DISABLED", direct[-1].file_id
+            if re.search(r"\b(active|present|rows=[1-9]|http_status=200)\b", text):
+                return "PRESENT", direct[-1].file_id
+            if re.search(r"\b(404|absent|not found|rows=0|deleted=true)\b", text):
+                return "ABSENT", direct[-1].file_id
+            if "redact" in text:
+                return "REDACTED", direct[-1].file_id
+            if "anonym" in text or "customer_reference=null" in text:
+                return "ANONYMIZED", direct[-1].file_id
+            return "PRESENT", direct[-1].file_id
+        snapshots = [item for item in evidence if item.path.suffix.lower() == ".sql"]
+        if snapshots:
+            return "ABSENT", snapshots[-1].file_id
+        return "", ""
+
     def _resource_kind(self, resource: str, system: str, text: str) -> str:
         s = f"{resource} {system} {text}".lower()
         if "data_flow" in s or "connector" in s: return "FLOW"
@@ -166,54 +266,171 @@ class AuditAgent:
     def investigate(self, row: pd.Series) -> tuple[str, list[dict[str, Any]]]:
         users, tokens = self.identities.resolve(row.email)
         audit_at = dt(row.audit_at)
-        evidence = self.evidence.matching(tokens, audit_at)
+        evidence_tokens = [token for token in tokens if not token.startswith("user_")]
+        evidence = self.evidence.matching(evidence_tokens, audit_at)
+        if not evidence:
+            evidence = self.evidence.matching(users, audit_at)
+        if not evidence:
+            evidence = [
+                item for item in self.evidence.items
+                if item.readable and item.path.suffix.lower() == ".sql"
+                and item.captured_at <= audit_at
+            ]
+            evidence = sorted(evidence, key=lambda item: item.captured_at)[-1:]
+        elif evidence:
+            latest_capture = max(item.captured_at for item in evidence)
+            evidence = [item for item in evidence if item.captured_at == latest_capture]
         self.interpreter.interpret(
-            tokens,
+            evidence_tokens,
             [{"file_id": item.file_id, "text": item.text[:12000]} for item in evidence],
         )
-        activities = self._activity_matches(tokens, audit_at)
+        activities = self._activity_window(row)
         findings: list[dict[str, Any]] = []
         resources: dict[tuple[str, str], tuple[str, str, str]] = {}
 
-        for _, a in activities.iterrows():
+        evidence_resources: dict[str, tuple[str, str]] = {}
+        evidence_paths: dict[str, str] = {}
+        evidence_text_ids = {
+            resource for item in evidence for resource in self.resource_re.findall(item.text)
+        }
+        for item in evidence:
+            for resource in self.evidence.related_resources(item, tokens, self.resource_re):
+                if resource.lower().endswith("_service"):
+                    continue
+                evidence_resources[resource] = (self._system_for(resource, item.text), item.file_id)
+                evidence_paths[resource] = item.path.suffix.lower()
+
+        selected: dict[str, pd.Series] = {}
+        account_rows = activities[
+            activities.target_system.eq("account_service") &
+            activities.event_type.eq("DELETE_RECORD")
+        ]
+        if not account_rows.empty:
+            selected[account_rows.iloc[-1].resource_id] = account_rows.iloc[-1]
+        if evidence_resources:
+            selected = {
+                resource: activity for resource, activity in selected.items()
+                if resource in evidence_resources
+            }
+            for _, a in activities.iterrows():
+                if a.resource_id in evidence_resources:
+                    selected[a.resource_id] = a
+            account_candidates = activities[
+                (activities.target_system == "account_service")
+                & (activities.event_type == "DELETE_RECORD")
+                & activities.resource_id.isin(evidence_text_ids)
+            ]
+            if not account_candidates.empty:
+                report_time = pd.Timestamp(dt(row.reported_at))
+                distances = (pd.to_datetime(account_candidates.event_time, utc=True)
+                             - report_time).abs()
+                chosen = account_candidates.iloc[int(distances.to_numpy().argmin())]
+                selected[chosen.resource_id] = chosen
+            analytics_candidates = activities[
+                (activities.target_system == "analytics_platform")
+                & (activities.event_type == "ANONYMIZE_RECORD")
+                & activities.resource_id.isin(evidence_text_ids)
+            ]
+            if not analytics_candidates.empty:
+                selected[analytics_candidates.iloc[-1].resource_id] = analytics_candidates.iloc[-1]
+            if re.search(r"\b(integration|sync|connector|backup|restore)\b",
+                         norm(row.request_text)):
+                for _, a in activities.iterrows():
+                    if a.event_type in {"CHECK_DATA_FLOW", "CHECK_RESTORE_ACCESS"}:
+                        selected[a.resource_id] = a
+            if not any(
+                activity.target_system == "account_service" for activity in selected.values()
+            ) and not any(key.startswith("account") for key in evidence_resources):
+                if not account_rows.empty:
+                    selected[account_rows.iloc[-1].resource_id] = account_rows.iloc[-1]
+        else:
+            for _, a in activities.iterrows():
+                if a.event_type in {"CHECK_DATA_FLOW", "CHECK_RESTORE_ACCESS"}:
+                    selected[a.resource_id] = a
+
+        activity_rows = pd.DataFrame(selected.values())
+        for _, a in activity_rows.iterrows() if not activity_rows.empty else []:
             text = f"{a.details} {a.resource_id}"
             if str(a.reported_result).upper() in {"SUCCESS", "PARTIAL", "FAILED"}:
                 kind = self._resource_kind(a.resource_id, a.target_system, text)
                 resources[(a.target_system, a.resource_id)] = (kind, a.activity_id, "")
-                typ = str(a.event_type)
-                if typ in {"CHECK_DATA_FLOW", "SYNC_RECORD"} and "enabled" in norm(a.details):
-                    findings.append(self._step("FINDING", a.target_system, a.resource_id,
-                                               "REPORT_ACTIVE_DATA_FLOW", "ACTIVE", a.activity_id))
-                elif typ == "CHECK_RESTORE_ACCESS" and "can still" in norm(a.details):
-                    findings.append(self._step("FINDING", a.target_system, a.resource_id,
-                                               "REPORT_RESTORE_RISK", "ACTIVE", a.activity_id))
 
-        for e in evidence:
-            for resource in sorted(set(self.resource_re.findall(e.text)), key=str):
-                # Keep only resources in a matching evidence artifact; the identity token
-                # match is the relationship proof and prevents unrelated corpus records.
-                if resource.lower().endswith("_service"):
-                    continue
-                system = self._system_for(resource, e.text)
-                kind = self._resource_kind(resource, system, e.text)
-                resources.setdefault((system, resource), (kind, e.file_id, e.file_id))
+        for resource, activity in selected.items():
+            system = activity.target_system
+            kind = self._resource_kind(resource, system, activity.details)
+            resources[(system, resource)] = (kind, activity.activity_id, "")
+        for resource, (system, citation) in evidence_resources.items():
+            if (
+                resource not in selected
+                and not resource.startswith(("audit_record_", "tombstone_"))
+                and evidence_paths.get(resource) not in {".json", ".pdf"}
+            ):
+                continue
+            kind = self._resource_kind(resource, system, "")
+            resources.setdefault((system, resource), (kind, citation, citation))
+
+        tombstones = [
+            activity for activity in selected.values()
+            if str(activity.resource_id).startswith("tombstone_")
+        ]
+        if tombstones and not any(
+            resource.startswith("account_") for _, resource in resources
+        ):
+            account_before = activities[
+                (activities.target_system == "account_service")
+                & (activities.event_type == "DELETE_RECORD")
+                & (pd.to_datetime(activities.event_time, utc=True)
+                   <= pd.Timestamp(tombstones[0].event_time))
+            ]
+            if not account_before.empty:
+                activity = account_before.iloc[-1]
+                resources[("account_service", activity.resource_id)] = (
+                    "ACCOUNT", activity.activity_id, ""
+                )
 
         # An evidence artifact can prove a current record only when it contains a direct
         # identity token and a resource. Interpret explicit state words conservatively.
         for (system, resource), (kind, citation, file_id) in resources.items():
             if kind == "FLOW" or kind == "BACKUP":
+                evidence_state, evidence_id = self._state_evidence(resource, evidence)
+                activity = next((a for a in selected.values() if a.resource_id == resource), None)
+                if kind == "FLOW" and (
+                    (activity is not None and "enabled" in norm(activity.details))
+                    or evidence_state == "PRESENT"
+                ):
+                    findings.append(self._step("FINDING", system, resource,
+                                               "REPORT_ACTIVE_DATA_FLOW", "ACTIVE",
+                                               evidence_id or citation))
+                elif kind == "BACKUP" and (
+                    (activity is not None and "can still" in norm(activity.details))
+                    or evidence_state == "PRESENT"
+                ):
+                    findings.append(self._step("FINDING", system, resource,
+                                               "REPORT_RESTORE_RISK", "ACTIVE",
+                                               evidence_id or citation))
                 continue
             action = {"ACCOUNT": "DELETE", "SEARCH": "DELETE", "EXPORT": "DELETE",
                       "MARKETING": "DELETE", "SUPPORT": "REDACT",
                       "ANALYTICS": "ANONYMIZE", "RETAIN": "RETAIN"}.get(kind, "DELETE")
-            evidence_text = " ".join(e.text for e in evidence if citation == e.file_id or citation == e.file_id)
-            lower = norm(evidence_text)
-            absent = any(x in lower for x in ("absent", "not found", "deleted=true", "deleted: true"))
-            redacted = "redact" in lower or "redacted" in lower
-            anonymized = "anonym" in lower
+            evidence_state, evidence_id = self._state_evidence(resource, evidence)
+            if evidence_id:
+                citation = evidence_id
+            absent = evidence_state == "ABSENT"
+            redacted = evidence_state == "REDACTED"
+            anonymized = evidence_state == "ANONYMIZED"
+            operation_result = ""
+            activity = next((a for a in selected.values() if a.resource_id == resource), None)
+            if activity is not None:
+                operation_result = str(activity.reported_result).upper()
             if action == "RETAIN":
                 if absent: continue
                 resources[(system, resource)] = (kind, citation, file_id)
+            elif (
+                (operation_result in {"FAILED", "PARTIAL"} and evidence_state != "ABSENT")
+                or (evidence_state == "PRESENT" and action == "DELETE")
+            ):
+                op = "REPORT_EXPOSED_PII" if action in {"REDACT", "ANONYMIZE"} else "REPORT_REMAINING_RECORD"
+                findings.append(self._step("FINDING", system, resource, op, "PRESENT", citation))
             elif absent and action == "DELETE":
                 continue
             elif action == "REDACT" and redacted:
@@ -226,7 +443,8 @@ class AuditAgent:
 
         # If no trustworthy identity exists, this is not a deletion request only when the
         # request text explicitly denies ownership; otherwise insufficient evidence is incomplete.
-        if re.search(r"\bnot my account\b|\bdid not request\b|\bbelongs to someone else\b", norm(row.request_text)):
+        if re.search(r"\bnot my account\b|\bdid not request(?:ed)?\b|\bno deletion request\b",
+                     norm(row.request_text)):
             return "NOT_APPLICABLE", []
 
         remediation: list[dict[str, Any]] = []
@@ -285,6 +503,8 @@ class AuditAgent:
         if "data_flow" in s or "connector" in s: return "integration_service"
         if "export" in s: return "export_service"
         if "marketing" in s: return "marketing_platform"
+        if "tombstone" in s: return "identity_service"
+        if "audit_record" in s: return "security_service"
         if "audit" in s or "security" in s: return "security_service"
         return "account_service"
 

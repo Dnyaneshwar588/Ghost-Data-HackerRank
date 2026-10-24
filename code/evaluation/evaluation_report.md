@@ -4,10 +4,10 @@ The deterministic pipeline processed 32 requests.
 
 ## Sample oracle metrics
 
-- Case-level status accuracy: 37.500% (12/32)
-- Exact step-array accuracy: 0.000% (0/32)
-- Field-level accuracy (aligned steps): 34.921% (374/1071)
-- Sequence accuracy: 0.000% (0/32)
+- Case-level status accuracy: 78.125% (25/32)
+- Exact step-array accuracy: 3.125% (1/32)
+- Field-level accuracy (aligned steps): 51.727% (659/1274)
+- Sequence accuracy: 9.375% (3/32)
 
 The sample oracle is loaded only by this evaluator; it is not used by the production agent.
 
@@ -15,7 +15,7 @@ The sample oracle is loaded only by this evaluator; it is not used by the produc
 
 - Manifest entries: 94
 - Missing/unreadable entries: 0
-- PDF/image entries without extracted text in this environment: 15
+- PDF/image entries without extracted text in this environment: 11
 - No evidence content was invented; unsupported artifacts are handled conservatively.
 
 ## Additional cases
@@ -28,6 +28,10 @@ The sample oracle is loaded only by this evaluator; it is not used by the produc
 
 ## Reliability tests and limitations
 
-The test suite covers timestamps, duplicate identifiers, missing evidence, malformed JSON,
-CSV escaping, false matches, and operation ordering. Unsupported or unreadable evidence is
-reported and never treated as proof of absence. PDF/image parsing is optional and conservative.
+The focused test module contains seven executable tests covering full-output shape, step
+numbering, historical identities, audit-time cutoffs, disabled-model determinism, invalid
+citations, and retained records. Unsupported or unreadable evidence is reported and never
+treated as proof of absence. PDF/image parsing is optional and conservative. The current
+sample score is not submission-grade: exact step-array and sequence accuracy remain low,
+which indicates that some synthetic evidence bundles still need stronger record-to-case
+linking.

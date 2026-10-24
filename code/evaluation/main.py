@@ -57,9 +57,13 @@ The sample oracle is loaded only by this evaluator; it is not used by the produc
 
 ## Reliability tests and limitations
 
-The test suite covers timestamps, duplicate identifiers, missing evidence, malformed JSON,
-CSV escaping, false matches, and operation ordering. Unsupported or unreadable evidence is
-reported and never treated as proof of absence. PDF/image parsing is optional and conservative.
+The focused test module contains seven executable tests covering full-output shape, step
+numbering, historical identities, audit-time cutoffs, disabled-model determinism, invalid
+citations, and retained records. Unsupported or unreadable evidence is reported and never
+treated as proof of absence. PDF/image parsing is optional and conservative. The current
+sample score is not submission-grade: exact step-array and sequence accuracy remain low,
+which indicates that some synthetic evidence bundles still need stronger record-to-case
+linking.
 """, encoding="utf-8")
     print(report)
 

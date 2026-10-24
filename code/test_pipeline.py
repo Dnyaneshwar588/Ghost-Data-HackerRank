@@ -1,6 +1,6 @@
 import json
 from pathlib import Path
-from pipeline import AuditAgent, IdentityResolver, dt
+from pipeline import AuditAgent, IdentityResolver, dt, validate_output
 
 
 def test_full_output_schema():
@@ -41,3 +41,26 @@ def test_llm_disabled_is_deterministic():
     agent = AuditAgent(root / "dataset", "sample_deletion_requests.csv")
     assert not agent.interpreter.enabled
     assert agent.interpreter.interpret(["user_01"], [])["evidence_refs"] == []
+
+
+def test_invalid_citation_is_rejected(tmp_path):
+    output = tmp_path / "output.csv"
+    output.write_text(
+        'case_id,deletion_status,steps_json\n'
+        'case_x,COMPLETE,"[{""step_no"":1,""phase"":""VERIFICATION"",'
+        '""system_id"":""account_service"",""resource_id"":""account_x"",'
+        '""operation"":""VERIFY_RECORD_ABSENT"",""state"":""ABSENT"",'
+        '""evidence_id"":""missing""}]"\n',
+        encoding="utf-8",
+    )
+    errors = validate_output(output, 1, {"valid_file"})
+    assert any(error.startswith("evidence ") for error in errors)
+
+
+def test_retained_records_are_not_planned_for_deletion():
+    root = Path(__file__).resolve().parents[1]
+    agent = AuditAgent(root / "dataset", "sample_deletion_requests.csv")
+    row = agent.requests[agent.requests.case_id == "case_31"].iloc[0]
+    _, steps = agent.investigate(row)
+    operations = {(step["resource_id"], step["operation"]) for step in steps}
+    assert ("audit_record_6909", "VERIFY_RECORD_PRESENT") in operations
